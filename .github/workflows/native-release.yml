@@ -313,6 +313,11 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
           persist-credentials: false
+          # actions/checkout defaults to `clean: true` (git clean -ffdx),
+          # which would delete the release/ artifacts already downloaded
+          # above. This checkout only needs LICENSE at $GITHUB_WORKSPACE;
+          # it must not touch anything else in the workspace.
+          clean: false
 
       - name: Normalize archives into artifacts/<target>/
         if: ${{ inputs.npm-package != '' }}
