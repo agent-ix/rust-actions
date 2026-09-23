@@ -1,0 +1,382 @@
+name: Native release (reusable)
+
+# Generic, cross-repo replacement for a repo-local "build four native
+# binaries, package them, cut a GitHub Release, optionally publish to npm"
+# workflow. Every project-specific detail (binary name, cargo package,
+# npm package) comes from inputs; this file has no knowledge of any one
+# consumer repo.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Existing git tag to build, e.g. v1.2.3."
+        required: true
+        type: string
+      binary:
+        description: 'Binary name, e.g. "quoin". On Windows the file is "<binary>.exe".'
+        required: true
+        type: string
+      cargo-package:
+        description: 'Cargo package to build with "-p". Defaults to the same name as `binary`.'
+        required: false
+        type: string
+        default: ""
+      cargo-dir:
+        description: "Directory containing the Cargo workspace/package, relative to the repo root."
+        required: false
+        type: string
+        default: "."
+      pre-build:
+        description: >-
+          Optional bash snippet run before `cargo build`, e.g. a `pnpm install
+          --frozen-lockfile` for a crate whose build.rs embeds JS-authored
+          fixtures. Run as `bash -c "$PRE_BUILD"` from the repo root, on every
+          matrix leg, including Windows (Git Bash).
+        required: false
+        type: string
+        default: ""
+      setup-pnpm:
+        description: >-
+          Install pnpm 11.20.0 and Node 22.15.0, then run
+          agent-ix/nodejs-actions/setup-npmrc@main with REGISTRY_TOKEN, before
+          `pre-build` runs. Needed when `pre-build` runs `pnpm install`
+          against @agent-ix-scoped packages.
+        required: false
+        type: boolean
+        default: false
+      npm-package:
+        description: >-
+          When set, also publish to npm via
+          agent-ix/nodejs-actions/publish-native-npm, e.g. "@agent-ix/quoin".
+        required: false
+        type: string
+        default: ""
+      npm-description:
+        description: "Description written into the npm launcher package.json. Required when npm-package is set."
+        required: false
+        type: string
+        default: ""
+      self-update-command:
+        description: 'Subcommand the npm launcher intercepts to print an "update with npm" hint, e.g. "update".'
+        required: false
+        type: string
+        default: ""
+      publish:
+        description: >-
+          When false (default), build, package and smoke every target, but
+          create no GitHub Release and publish nothing to npm. When true,
+          also cut the release and, if npm-package is set, publish it.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      REGISTRY_TOKEN:
+        description: >-
+          Optional. Used to authenticate `pnpm install` against
+          @agent-ix-scoped GitHub Packages (via setup-npmrc, when
+          setup-pnpm is true) and to authenticate private cargo git
+          dependencies (via a global git insteadOf rewrite, when non-empty).
+        required: false
+      NPM_TOKEN:
+        description: >-
+          Optional npm auth token, passed through to publish-native-npm.
+          Trusted-publisher packages publish tokenlessly via OIDC as long as
+          the calling job grants `id-token: write`; this only matters for a
+          package with no trusted publisher configured yet.
+        required: false
+
+# A reusable workflow's effective permissions are the intersection of what it
+# declares and what the caller's job grants. Declaring `id-token: write` and
+# `contents: write` here would do nothing if the caller doesn't also grant
+# them -- see README.md for the exact caller-side permissions this workflow
+# needs.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    # A hung step otherwise blocks for GitHub's 6-hour default.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds on 22.04 so the binary links glibc 2.35 and runs on
+          # Ubuntu 22.04+ and default WSL; a 24.04 build needs glibc 2.39 and
+          # fails to start there.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            extension: tar.gz
+            exe-suffix: ""
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            extension: tar.gz
+            exe-suffix: ""
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            extension: tar.gz
+            exe-suffix: ""
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            extension: zip
+            exe-suffix: ".exe"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Configure git for private cargo git dependencies
+        if: ${{ secrets.REGISTRY_TOKEN != '' }}
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global url."https://x-access-token:${REGISTRY_TOKEN}@github.com/".insteadOf https://github.com/
+
+      - if: ${{ inputs.setup-pnpm }}
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.20.0
+
+      - if: ${{ inputs.setup-pnpm }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.15.0
+          cache: pnpm
+
+      # @agent-ix/* scoped packages live on GitHub Packages, not public npm.
+      # Without this, `pnpm install` in pre-build falls back to
+      # registry.npmjs.org and 404s on every @agent-ix package.
+      - if: ${{ inputs.setup-pnpm }}
+        uses: agent-ix/nodejs-actions/setup-npmrc@main
+        with:
+          npm_registry_token: ${{ secrets.REGISTRY_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.98.1
+
+      - name: Run pre-build
+        if: ${{ inputs.pre-build != '' }}
+        shell: bash
+        env:
+          PRE_BUILD: ${{ inputs.pre-build }}
+        run: bash -c "$PRE_BUILD"
+
+      - name: Resolve the cargo package to build
+        shell: bash
+        env:
+          IN_CARGO_PACKAGE: ${{ inputs.cargo-package }}
+          IN_BINARY: ${{ inputs.binary }}
+        run: |
+          set -euo pipefail
+          echo "CARGO_PACKAGE=${IN_CARGO_PACKAGE:-$IN_BINARY}" >> "$GITHUB_ENV"
+
+      - name: Build the native binary
+        shell: bash
+        env:
+          CARGO_DIR: ${{ inputs.cargo-dir }}
+          BINARY: ${{ inputs.binary }}
+        run: |
+          set -euo pipefail
+          cd "$CARGO_DIR"
+          cargo build --locked --release -p "$CARGO_PACKAGE" --bin "$BINARY"
+
+      - name: Package the one permitted archive member
+        shell: bash
+        env:
+          CARGO_DIR: ${{ inputs.cargo-dir }}
+          BINARY: ${{ inputs.binary }}
+          TARGET: ${{ matrix.target }}
+          EXTENSION: ${{ matrix.extension }}
+          EXE_SUFFIX: ${{ matrix.exe-suffix }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BINARY_FILE="${BINARY}${EXE_SUFFIX}"
+          NAME="${BINARY}-v${VERSION}-${TARGET}.${EXTENSION}"
+          RELEASE_DIR="$GITHUB_WORKSPACE/release"
+          mkdir -p "$RELEASE_DIR"
+          if [ "$EXTENSION" = tar.gz ]; then
+            tar -C "$CARGO_DIR/target/release" -czf "$RELEASE_DIR/$NAME" "$BINARY_FILE"
+          else
+            # Git Bash on the Windows runner has no `zip`; 7-Zip is preinstalled.
+            (cd "$CARGO_DIR/target/release" && 7z a -tzip -bso0 "$RELEASE_DIR/$NAME" "$BINARY_FILE")
+          fi
+          test -f "$RELEASE_DIR/$NAME"
+
+      - name: Smoke the packaged native executable
+        shell: bash
+        env:
+          BINARY: ${{ inputs.binary }}
+          TARGET: ${{ matrix.target }}
+          EXTENSION: ${{ matrix.extension }}
+          EXE_SUFFIX: ${{ matrix.exe-suffix }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BINARY_FILE="${BINARY}${EXE_SUFFIX}"
+          NAME="${BINARY}-v${VERSION}-${TARGET}.${EXTENSION}"
+          SMOKE_DIR="$GITHUB_WORKSPACE/release-smoke"
+          mkdir -p "$SMOKE_DIR"
+          if [ "$EXTENSION" = tar.gz ]; then
+            tar -C "$SMOKE_DIR" -xzf "$GITHUB_WORKSPACE/release/$NAME"
+          else
+            7z x -bso0 -o"$SMOKE_DIR" "$GITHUB_WORKSPACE/release/$NAME"
+          fi
+          test "$(find "$SMOKE_DIR" -type f | wc -l | tr -d ' ')" = 1
+          test -f "$SMOKE_DIR/$BINARY_FILE"
+          OUTPUT="$("$SMOKE_DIR/$BINARY_FILE" --version)"
+          echo "$OUTPUT"
+          # Whole-word match: catches a stale/-dirty build reporting the
+          # wrong version, without false-matching e.g. 0.3.1 inside 0.3.10.
+          if ! printf '%s' "$OUTPUT" | grep -qw -- "$VERSION"; then
+            echo "::error::${BINARY} --version printed '${OUTPUT}', expected it to contain '${VERSION}' as a whole word" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ inputs.binary }}-${{ matrix.target }}
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release${{ inputs.npm-package != '' && ' and npm package' || '' }}
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Compute the release version
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Build the update manifest and checksums
+        shell: bash
+        env:
+          BINARY: ${{ inputs.binary }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          asset() {
+            target="$1"; suffix="$2"; format="$3"
+            name="${BINARY}-v${VERSION}-${target}.${suffix}"
+            size=$(wc -c < "release/$name" | tr -d ' ')
+            digest=$(sha256sum "release/$name" | cut -d ' ' -f1)
+            jq -n --arg target "$target" --arg asset "$name" --arg archive "$format" --argjson size "$size" --arg sha256 "$digest" --arg url "https://github.com/${REPOSITORY}/releases/download/${TAG}/${name}" '{target:$target,asset:$asset,archive:$archive,size:$size,sha256:$sha256,url:$url}'
+          }
+          jq -n --arg version "$VERSION" --slurpfile artifacts <(asset x86_64-unknown-linux-gnu tar.gz tar-gz; asset aarch64-unknown-linux-gnu tar.gz tar-gz; asset aarch64-apple-darwin tar.gz tar-gz; asset x86_64-pc-windows-msvc zip zip) '{schema_version:1,version:$version,artifacts:$artifacts}' > "release/${BINARY}-update-manifest.json"
+          jq -e '.schema_version == 1 and (.artifacts | length == 4)' "release/${BINARY}-update-manifest.json" > /dev/null
+          (cd release && sha256sum -- *.tar.gz *.zip > SHA256SUMS.txt)
+
+      - name: Create the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          BINARY: ${{ inputs.binary }}
+        run: |
+          set -euo pipefail
+          # This job has no checkout of the caller repo, so gh cannot infer
+          # the repository on its own.
+          REPO="$GITHUB_REPOSITORY"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists on $REPO; skipping creation (idempotent re-run)."
+          else
+            gh release create "$TAG" --repo "$REPO" --verify-tag --title "$BINARY $TAG" --generate-notes release/*
+          fi
+
+      - name: Checkout the caller repo for LICENSE
+        if: ${{ inputs.npm-package != '' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Normalize archives into artifacts/<target>/
+        if: ${{ inputs.npm-package != '' }}
+        shell: bash
+        env:
+          BINARY: ${{ inputs.binary }}
+        run: |
+          set -euo pipefail
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+            mkdir -p "artifacts/$target"
+            asset="release/${BINARY}-v${VERSION}-${target}.tar.gz"
+            if [ -f "$asset" ]; then
+              tar -C "artifacts/$target" -xzf "$asset"
+            else
+              asset="release/${BINARY}-v${VERSION}-${target}.zip"
+              unzip -q -o "$asset" -d "artifacts/$target"
+            fi
+          done
+
+      - name: Package and publish the npm distribution
+        if: ${{ inputs.npm-package != '' }}
+        uses: agent-ix/nodejs-actions/publish-native-npm@main
+        with:
+          package: ${{ inputs.npm-package }}
+          binary: ${{ inputs.binary }}
+          version: ${{ env.VERSION }}
+          artifacts-dir: artifacts
+          repository: ${{ github.repository }}
+          description: ${{ inputs.npm-description }}
+          self-update-command: ${{ inputs.self-update-command }}
+          publish: "true"
+          npm-token: ${{ secrets.NPM_TOKEN }}
+
+      - name: Smoke the published npm package
+        if: ${{ inputs.npm-package != '' }}
+        shell: bash
+        env:
+          NPM_PACKAGE: ${{ inputs.npm-package }}
+          BINARY: ${{ inputs.binary }}
+        run: |
+          set -euo pipefail
+          PREFIX="$(mktemp -d)"
+          NPMRC="$(mktemp)"
+          printf '@agent-ix:registry=https://registry.npmjs.org/\n' > "$NPMRC"
+          export NPM_CONFIG_USERCONFIG="$NPMRC"
+          export NPM_CONFIG_PREFIX="$PREFIX"
+          export PATH="$PREFIX/bin:$PATH"
+
+          # Public npm can take a little while to serve a just-published
+          # version; retry with backoff for roughly two minutes rather than
+          # failing the run on ordinary propagation delay.
+          attempt=0
+          max_attempts=8
+          until npm install --global "${NPM_PACKAGE}@${VERSION}"; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::npm install of ${NPM_PACKAGE}@${VERSION} did not succeed after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+          OUTPUT="$("$PREFIX/bin/$BINARY" --version)"
+          if ! printf '%s' "$OUTPUT" | grep -qw -- "$VERSION"; then
+            echo "::error::${BINARY} --version printed '${OUTPUT}', expected it to contain '${VERSION}' as a whole word" >&2
+            exit 1
+          fi
