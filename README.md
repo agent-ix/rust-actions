@@ -137,6 +137,6 @@ repo does not vendor or duplicate their release logic in the meantime.
 make lint
 ```
 
-YAML-parses every workflow under `.github/workflows/` with `python3`'s
-`yaml.safe_load`, and runs [`actionlint`](https://github.com/rhysd/actionlint)
-over them when it's installed on `PATH`.
+Runs [`actionlint`](https://github.com/rhysd/actionlint) over every workflow,
+and fails if actionlint is not on `PATH`. Install it with
+`gh release download -R rhysd/actionlint -p '*linux_amd64.tar.gz'`.
