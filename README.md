@@ -1,6 +1,6 @@
 # rust-actions
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/k8DVhuYBR2)
+[![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/k8DVhuYBR2) [![IX Actions](https://github.com/agent-ix/agent-plugins/raw/refs/heads/main/assets/ix-actions.svg)](https://github.com/agent-ix/agent-plugins)
 
 Reusable GitHub workflow for releasing agent-ix Rust binaries: build four
 native targets, package one archive per target, cut a GitHub Release, and
